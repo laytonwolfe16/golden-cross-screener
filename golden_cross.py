@@ -1,118 +1,181 @@
 """
-Stock Screener + Backtester
-Pulls data, flags golden cross buy signals, visualizes
-the signals, and backtests whether they worked historically
+Golden Cross Screener + Backtester
+
+Pulls price history, flags golden crosses (50-day MA crossing above the
+200-day MA), charts them, and backtests what happened afterward -- compared
+against a baseline of "buying on a random day" so the result actually means
+something.
+
+Usage:
+    python golden_cross.py
+    python golden_cross.py --tickers AAPL MSFT NVDA --period 10y --plot NVDA
 """
 
-# (Imports)
-import yfinance as yf
-import pandas as pd
-import matplotlib.pyplot as plt
+import argparse
 import sqlite3
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import yfinance as yf
+
+DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "JPM"]
+FAST_WINDOW = 50
+SLOW_WINDOW = 200
+HORIZONS = (20, 60, 120)  # trading days to look ahead after a signal
+OUTPUT_DIR = Path("output")
 
 
-# Step 1: Choose stocks to screen
-#-------------------------------------------
-tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "JPM"]
+# ---------------------------------------------------------------- data
+def download_prices(tickers, period):
+    """Download daily prices; skip tickers that fail or have too little data."""
+    data = {}
+    for symbol in tickers:
+        print(f"Pulling data for {symbol}...")
+        try:
+            df = yf.Ticker(symbol).history(period=period, auto_adjust=True)
+        except Exception as exc:  # network errors, bad tickers, etc.
+            print(f"  Skipping {symbol}: {exc}")
+            continue
+        if df.empty or len(df) <= SLOW_WINDOW:
+            print(f"  Skipping {symbol}: not enough data")
+            continue
+        df.index = df.index.tz_localize(None)  # simpler for CSV/SQLite
+        data[symbol] = df
+    return data
 
-# -------------------------------------------
-# Step 2: Pull the 2 years of price history
-# -------------------------------------------
 
-all_data = {}
+# ------------------------------------------------------------- signals
+def add_signals(df):
+    """Add moving averages and flag golden cross days."""
+    df = df.copy()
+    df["MA_FAST"] = df["Close"].rolling(FAST_WINDOW).mean()
+    df["MA_SLOW"] = df["Close"].rolling(SLOW_WINDOW).mean()
+    above = df["MA_FAST"] > df["MA_SLOW"]  # False while MAs are still NaN
+    df["above"] = above
+    df["golden_cross"] = above & ~above.shift(1, fill_value=False)
+    return df
 
-for symbol in tickers:
-    print(f"Pulling data for {symbol}...")
-    stock = yf.Ticker(symbol)
-    all_data[symbol] = stock.history(period="2y")
 
-# -------------------------------------------
-# STEP 3: Calculate moving averages
-# -------------------------------------------
-for symbol, df in all_data.items():
-    df["MA50"] = df["Close"].rolling(window=50).mean()
-    df["MA200"] = df["Close"].rolling(window=200).mean()
+# ------------------------------------------------------------ screener
+def print_screen(data, lookback=5):
+    print("\n--- Current Screener Results ---")
+    for symbol, df in data.items():
+        recent = df["golden_cross"].iloc[-lookback:].any()
+        in_uptrend = bool(df["above"].iloc[-1])
+        if recent:
+            print(f"{symbol}: NEW golden cross in the last {lookback} days")
+        elif in_uptrend:
+            print(f"{symbol}: 50-day is above 200-day (no fresh cross)")
 
-# -------------------------------------------
-# STEP 4: Flag "golden cross" signals
-# (The moment 50-day average crosses ABOVE 200-day average)
-# -------------------------------------------
-for symbol, df in all_data.items():
-    df["above"] = df["MA50"] > df["MA200"]
-    df["crossover"] = df["above"] & ~df["above"].shift(1).fillna(False)
 
-# -------------------------------------------
-# STEP 5: Print which stocks currently have an active signal
-# -------------------------------------------
-print("\n--- Current Screener Results ---")
-for symbol, df in all_data.items():
-    if df["crossover"].iloc[-5:].any():
-        print(f"{symbol}: recent golden cross detected")
+# ------------------------------------------------------------ backtest
+def backtest(data, horizons=HORIZONS):
+    """
+    For every golden cross, measure the forward return at each horizon.
+    Also compute a baseline: the forward return from ANY day (once the
+    200-day MA exists). A signal only "works" if it beats the baseline.
+    """
+    trades = []
+    baseline = {h: [] for h in horizons}
 
-# -------------------------------------------
-# STEP 6: Save results to CSV
-# -------------------------------------------
-for symbol, df in all_data.items():
-    df.to_csv(f"{symbol}_data.csv")
+    for symbol, df in data.items():
+        fwd = {h: (df["Close"].shift(-h) / df["Close"] - 1) * 100 for h in horizons}
+        valid = df["MA_SLOW"].notna()
+        for h in horizons:
+            baseline[h].append(fwd[h][valid].dropna())
 
-# -------------------------------------------
-# STEP 7: Save results to a SQLite database
-# -------------------------------------------
-conn = sqlite3.connect("stocks.db")
-for symbol, df in all_data.items():
-    df.to_sql(symbol, conn, if_exists="replace")
-conn.close()
-print("\nSaved all data to stocks.db")
+        for date in df.index[df["golden_cross"]]:
+            row = {"symbol": symbol, "signal_date": date.strftime("%Y-%m-%d")}
+            for h in horizons:
+                row[f"ret_{h}d_pct"] = round(fwd[h].loc[date], 2)
+            trades.append(row)
 
-# -------------------------------------------
-# STEP 8: Visualize one stock's price with the moving averages
-# -------------------------------------------
-symbol_to_plot = "MSFT"
-df = all_data[symbol_to_plot]
+    trades_df = pd.DataFrame(trades)
 
-plt.figure(figsize=(12, 6))
-plt.plot(df.index, df["Close"], label="Price", linewidth=1)
-plt.plot(df.index, df["MA50"], label="50-day MA", linewidth=1)
-plt.plot(df.index, df["MA200"], label="200-day MA", linewidth=1)
+    summary = []
+    for h in horizons:
+        col = f"ret_{h}d_pct"
+        vals = trades_df[col].dropna() if not trades_df.empty else pd.Series(dtype=float)
+        base = pd.concat(baseline[h])
+        summary.append({
+            "horizon_days": h,
+            "signals": len(vals),
+            "signal_mean_pct": round(vals.mean(), 2),
+            "signal_median_pct": round(vals.median(), 2),
+            "signal_win_rate_pct": round((vals > 0).mean() * 100, 1),
+            "baseline_mean_pct": round(base.mean(), 2),
+            "baseline_win_rate_pct": round((base > 0).mean() * 100, 1),
+        })
+    return trades_df, pd.DataFrame(summary)
 
-# Mark the crossovers on the chart
-crossover_points = df[df["crossover"]]
-plt.scatter(crossover_points.index, crossover_points["Close"],
-            color="green", marker="^", s=100, label="Buy Signal", zorder=5)
 
-plt.title(f"{symbol_to_plot} Price with Golden Cross Signals")
-plt.xlabel("Date")
-plt.ylabel("Price ($)")
-plt.legend()
-plt.tight_layout()
-plt.show()
+# ---------------------------------------------------------------- plot
+def plot_stock(df, symbol, show=False):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(df.index, df["Close"], label="Price", linewidth=1)
+    ax.plot(df.index, df["MA_FAST"], label=f"{FAST_WINDOW}-day MA", linewidth=1)
+    ax.plot(df.index, df["MA_SLOW"], label=f"{SLOW_WINDOW}-day MA", linewidth=1)
+    crosses = df[df["golden_cross"]]
+    ax.scatter(crosses.index, crosses["Close"], color="green", marker="^",
+               s=100, label="Golden cross", zorder=5)
+    ax.set_title(f"{symbol} Price with Golden Cross Signals")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price ($)")
+    ax.legend()
+    fig.tight_layout()
+    path = OUTPUT_DIR / f"{symbol}_chart.png"
+    fig.savefig(path, dpi=150)
+    print(f"Saved chart to {path}")
+    if show:
+        plt.show()
+    plt.close(fig)
 
-# ----------------------------------------------
-# STEP 9: Backtest - what happened after each past signal?
-# ----------------------------------------------
-results = []
 
-for symbol, df in all_data.items():
-    crossover_dates = df[df["crossover"]].index
-    for date in crossover_dates:
-        idx = df.index.get_loc(date)
-        if idx+60 < len(df): # need 60 future trading days to measure
-            start_price = df["Close"].iloc[idx]
-            future_price = df["Close"].iloc[idx+60]
-            pct_change = (future_price - start_price) / start_price * 100
-            results.append({
-                "symbol": symbol,
-                "signal_date": date.strftime("%Y-%m-%d"),
-                "return_60d_pct": round(pct_change, 2),
-            })
+# --------------------------------------------------------------- saving
+def save_data(data):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    with sqlite3.connect(OUTPUT_DIR / "stocks.db") as conn:
+        for symbol, df in data.items():
+            df.to_csv(OUTPUT_DIR / f"{symbol}_data.csv")
+            df.to_sql(symbol, conn, if_exists="replace")
+    print(f"\nSaved CSVs and stocks.db to {OUTPUT_DIR}/")
 
-results_df = pd.DataFrame(results)
 
-print("\n--- Backtest Results ---")
-if not results_df.empty:
-    print(results_df)
-    print(f"\nAverage 60-day return after signal: {results_df['return_60d_pct'].mean():.2f}%")
-    print(f"Number of signals tested: {len(results_df)}")
-    print(f"Win rate (positive return): {(results_df['return_60d_pct'] >  0).mean() * 100:.1f}%")
-else:
-    print("No signals found with enough future data to backtest. Try a longer history period.")
+# ----------------------------------------------------------------- main
+def main():
+    parser = argparse.ArgumentParser(description="Golden cross screener + backtester")
+    parser.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS)
+    parser.add_argument("--period", default="10y", help="e.g. 5y, 10y, max")
+    parser.add_argument("--plot", default=None, help="ticker to chart (default: first)")
+    parser.add_argument("--show", action="store_true", help="open the chart window")
+    args = parser.parse_args()
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    raw = download_prices([t.upper() for t in args.tickers], args.period)
+    if not raw:
+        print("No data downloaded. Check your internet connection and tickers.")
+        return
+    data = {symbol: add_signals(df) for symbol, df in raw.items()}
+
+    print_screen(data)
+    save_data(data)
+
+    plot_symbol = (args.plot or next(iter(data))).upper()
+    if plot_symbol in data:
+        plot_stock(data[plot_symbol], plot_symbol, show=args.show)
+
+    trades, summary = backtest(data)
+    trades.to_csv(OUTPUT_DIR / "backtest_trades.csv", index=False)
+    summary.to_csv(OUTPUT_DIR / "backtest_summary.csv", index=False)
+
+    print("\n--- Backtest: every signal ---")
+    print(trades.to_string(index=False) if not trades.empty else "No signals found.")
+    print("\n--- Backtest summary (signal vs. buying on any day) ---")
+    print(summary.to_string(index=False))
+    print("\nNote: small sample sizes and a hand-picked list of large, "
+          "successful companies (survivorship bias) limit what this proves.")
+
+
+if __name__ == "__main__":
+    main()
