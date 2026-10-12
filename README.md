@@ -27,5 +27,24 @@ Python, pandas, yfinance, matplotlib, SQLite
 I learned how to build a Python program that tests a specific stock strategy based on past stock data. I learned how to import stock price data through libraries such as yfinance, and how to use them in Python code to track buy signals. I also learned how to create graphs in code and plot specific markers to make interpreting the data easier. In addition, I now understand what backtesting is and how it can be a valuable financial tool to test markets and investing strategies. While working, I was first confused about how to import libraries and actually create the graphs, but after more testing and some fixes, I was able to produce this project. This is still just an entry-level project, and there is much more to be improved, but I thoroughly enjoyed working on the project and learning from it.
 
 ### What's next
-The problems above are what I will fix in v2 with assistance from Claude (an AI coding assistant). v2 will add a comparison to random days, use 10 years of data, and test different time lengths.
+These problems led to v2 (below), which I built with help from Claude, an AI coding assistant.
 
+## v2.0: Improved Screener
+Built with help from Claude, an AI coding assistant, after I wrote v1 myself.
+
+### What changed
+- Compares signals to buying on a random day, so I can tell if the signal actually helps
+- Uses 10 years of data instead of 2
+- Tests 20, 60, and 120 trading days after each signal
+- Adds command-line options like `--tickers` and `--plot`
+- Saves charts as images and skips stocks that fail to download
+
+### Example chart
+![Chart](AAPL_chart.png)
+
+### How to run
+    pip install -r requirements.txt
+    python golden_cross.py
+
+### Still limited
+The stocks are hand-picked large companies, some results have small sample sizes, and fees and taxes aren't included.
